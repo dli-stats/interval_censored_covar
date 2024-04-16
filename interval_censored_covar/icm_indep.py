@@ -27,6 +27,8 @@ import jaxopt.linear_solve
 
 import jax_newton_raphson as jnr
 
+import simpleeval
+
 from interval_censored_covar import batch_util
 
 T1Predictor = Callable[[chex.Array], chex.Array]
@@ -68,7 +70,7 @@ def dat_gen(key: chex.PRNGKey,
             beta1: float,
             a1: int,
             b1: int,
-            a2: int, 
+            a2: int,
             b2: int,
             time1_frequency: str,
             time2_frequency: str,
@@ -1545,3 +1547,73 @@ def make_cf_funs(param_templ: Parameters, use_cg: bool = False):
     hess = functools.partial(make_derivfn, jax.hessian)
 
     return jac, hess
+
+
+def build_covs_fns_helper(param_tmpl, sample_size, clustered, solver, covs):
+    solver = dict(solver)
+
+    def all_cov_fn(*args):
+        static_sizes = args[0]
+        cov_results = {}
+
+        infered_sandwich = clustered
+
+        def ad(use_cg=False, sandwich: Optional[bool] = None):
+            sandwich = infered_sandwich if sandwich is None else sandwich
+            covs = compute_cov(
+                *args,
+                param_mask=cov_sandwich_deriv_all,
+                return_sandwich=sandwich,
+                jacfn=jax.jacobian,
+                hessfn="cg" if use_cg else jax.hessian,
+            )
+            if sandwich:
+                cov_results["hessinv-all-ad"], cov_results[
+                    "sandwich-ad"] = covs
+            else:
+                cov_results["hessinv-all-ad"] = covs
+
+        def cf(use_cg: bool = False, sandwich: Optional[bool] = None):
+            sandwich = infered_sandwich if sandwich is None else sandwich
+            jacfn, hessfn = make_cf_funs(param_tmpl, use_cg=use_cg)
+            covs = compute_cov(
+                *args,
+                param_mask=cov_sandwich_deriv_only_beta_beta1,
+                return_sandwich=sandwich,
+                jacfn=jacfn,
+                hessfn=hessfn,
+            )
+            if sandwich:
+                cov_results["hessinv-bg-cf"], cov_results[
+                    "sandwich-bg-cf"] = covs
+            else:
+                cov_results["hessinv-bg-cf"] = covs
+
+        def fd(eps: bool, sandwich: Optional[bool] = None):
+            sandwich = infered_sandwich if sandwich is None else sandwich
+            jacfn, hessfn = make_fd_funs(static_sizes, param_tmpl,
+                                         eps / np.sqrt(sample_size), **solver)
+            fd_name = f"bg-fd-{eps}"
+            covs = compute_cov(
+                *args,
+                param_mask=cov_sandwich_deriv_only_beta_beta1,
+                return_sandwich=sandwich,
+                jacfn=jacfn,
+                hessfn=hessfn,
+            )
+            if sandwich:
+                cov_results[f"hessinv-{fd_name}"], cov_results[
+                    f"sandwich-{fd_name}"] = covs
+            else:
+                cov_results[f"hessinv-{fd_name}"] = covs
+
+        parser = simpleeval.EvalWithCompoundTypes(functions={
+            "ad": ad,
+            "cf": cf,
+            "fd": fd
+        })
+        if covs:
+            parser.eval(covs)
+        return cov_results
+
+    return all_cov_fn
