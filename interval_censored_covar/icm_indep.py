@@ -27,7 +27,7 @@ import jaxopt.linear_solve
 
 import jax_newton_raphson as jnr
 
-import batch_util
+from interval_censored_covar import batch_util
 
 T1Predictor = Callable[[chex.Array], chex.Array]
 
