@@ -9,9 +9,9 @@ setup(
     python_requires='>=3.9',
     install_requires=[
         'chex==0.1.6',
-        'jax==0.4.4',
+        'jax==0.4.26',
         'jax-newton-raphson @ git+https://github.com/thisiscam/jax_newton_raphson@3ea78f5d158d4a1a3094996f613626884ecc6995',
-        'jaxlib==0.4.4',
+        'jaxlib==0.4.26',
         'jaxopt==0.6',
         'matplotlib==3.7.0',
         'numba==0.56.4',
