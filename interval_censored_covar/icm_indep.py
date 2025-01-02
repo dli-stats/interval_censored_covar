@@ -73,6 +73,7 @@ def dat_gen(key: chex.PRNGKey,
             b1: int,
             a2: int,
             b2: int,
+            z2_bernoulli: bool,
             time1_frequency: str,
             time2_frequency: str,
             t1_predictor: T1Predictor = time1_identity_predictor,
@@ -164,7 +165,10 @@ def dat_gen(key: chex.PRNGKey,
     cluster_id = jnp.where(cluster_mask, cluster_id, -1)
 
     # Generate z2 (the covariate for true_times2)
-    z2_original = jrandom.bernoulli(z2_key, p=0.5, shape=(sample_size, ))
+    if z2_bernoulli:
+        z2_original = jrandom.bernoulli(z2_key, p=0.5, shape=(sample_size, ))
+    else:
+        z2_original = jrandom.normal(z2_key, shape=(sample_size, ))
     z2 = jnp.broadcast_to(z2_original[..., None],
                           (sample_size, max_cluster_size))
 
@@ -953,17 +957,17 @@ LoopState = collections.namedtuple(
 
 
 def solve_theta(
-    static_sizes: StaticSizes,
-    pd: PreprocessedData,
-    initial_guess: Parameters,
-    e_step_tol=1e-3,
-    m_step_tol=1e-3,
-    e_step_maxiter=1000,
-    m_step_maxiter=1000,
-    m_step_ls_maxiter=10,
-    t1_predictor: T1Predictor = time1_identity_predictor,
-    update_beta_beta1_xi_include_lambda2_closed_form: bool = False,
-    update_beta_beta1_xi: bool = True,
+        static_sizes: StaticSizes,
+        pd: PreprocessedData,
+        initial_guess: Parameters,
+        e_step_tol=1e-3,
+        m_step_tol=1e-3,
+        e_step_maxiter=1000,
+        m_step_maxiter=1000,
+        m_step_ls_maxiter=10,
+        t1_predictor: T1Predictor = time1_identity_predictor,
+        update_beta_beta1_xi_include_lambda2_closed_form: bool = False,
+        fix_params: Sequence[str] = tuple(),
 ):
     """solve for theta using the EM algorithm"""
     pd = _fix_sizes(
@@ -998,51 +1002,33 @@ def solve_theta(
         state = state._replace(theta_prev=state.theta_current)
 
         # Update beta2, beta1, log_lambda1
-        if update_beta_beta1_xi:
-            x = (
-                state.theta_current.gamma,
-                state.theta_current.beta2,
-                state.theta_current.beta1,
-                state.theta_current.log_lambda1,
-            )
-            x_flat, x_unraveler = jax.flatten_util.ravel_pytree(x)
+        all_params = ["gamma", "beta2", "beta1", "log_lambda1"]
+        update_params = [p for p in all_params if p not in fix_params]
+        x = {k: getattr(state.theta_current, k) for k in update_params}
+        x_flat, x_unraveler = jax.flatten_util.ravel_pytree(x)
 
-            def coord_q(x_flat: chex.Array) -> float:
-                current_theta = state.theta_current
-                gamma, beta2, beta1, log_lambda1 = x_unraveler(x_flat)
-                theta = current_theta._replace(
-                    gamma=gamma,
-                    beta2=beta2,
-                    beta1=beta1,
-                    log_lambda1=log_lambda1,
+        def coord_q(x_flat: chex.Array) -> float:
+            current_theta = state.theta_current
+            theta = current_theta._replace(**x_unraveler(x_flat))
+            if update_beta_beta1_xi_include_lambda2_closed_form:
+                log_lambda2 = update_lambda2(
+                    pd,
+                    current_theta,
+                    theta,
+                    t1_predictor=t1_predictor,
                 )
-                if update_beta_beta1_xi_include_lambda2_closed_form:
-                    log_lambda2 = update_lambda2(
-                        pd,
-                        current_theta,
-                        theta,
-                        t1_predictor=t1_predictor,
-                    )
-                    theta = theta._replace(log_lambda2=log_lambda2)
-                return -q_for_estep(pd, current_theta, theta, t1_predictor)
+                theta = theta._replace(log_lambda2=log_lambda2)
+            return -q_for_estep(pd, current_theta, theta, t1_predictor)
 
-            opt_result = jnr.minimize(coord_q,
-                                      x_flat,
-                                      atol=1e-3,
-                                      rtol=m_step_tol,
-                                      maxiter=m_step_maxiter,
-                                      maxls=m_step_ls_maxiter)
-            new_gamma, new_beta2, new_beta1, new_log_lambda1 = x_unraveler(
-                opt_result.guess)
-            state = state._replace(m_step_status=opt_result.status)
-        else:
-            # Use the previous beta and beta1
-            new_gamma, new_beta2, new_beta1, new_log_lambda1 = (
-                state.theta_current.gamma,
-                state.theta_current.beta2,
-                state.theta_current.beta1,
-                state.theta_current.log_lambda1,
-            )
+        opt_result = jnr.minimize(coord_q,
+                                  x_flat,
+                                  atol=1e-3,
+                                  rtol=m_step_tol,
+                                  maxiter=m_step_maxiter,
+                                  maxls=m_step_ls_maxiter)
+        new_gamma, new_beta2, new_beta1, new_log_lambda1 = x_unraveler(
+            opt_result.guess)
+        state = state._replace(m_step_status=opt_result.status)
 
         # Update Lambda2
         new_log_lambda2 = update_lambda2(
