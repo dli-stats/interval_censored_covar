@@ -21,6 +21,7 @@ import jax.nn
 import jax.lax
 
 import jax.flatten_util
+import jax.tree_util
 import jax.debug
 
 import jaxopt.linear_solve
@@ -531,7 +532,7 @@ def preprocess_data(input_data: IntervalCensoredData) -> PreprocessedData:
 
     episode_size = input_data.z2.shape[0]
 
-    input_data = jax.tree_map(
+    input_data = jax.tree_util.tree_map(
         lambda x: np.asarray(x)[input_data.cluster_mask]
         if np.ndim(x) > 0 and x.shape[0] == episode_size else x, input_data)
 
@@ -972,7 +973,7 @@ def solve_theta(
     import jax.numpy as jnp
 
     init_state = LoopState(
-        theta_prev=jax.tree_map(
+        theta_prev=jax.tree_util.tree_map(
             functools.partial(jnp.full_like, fill_value=jnp.inf),
             initial_guess),
         theta_current=initial_guess,
@@ -1302,8 +1303,8 @@ def compute_cov(
 
     theta_flat, theta_unraveler = jax.flatten_util.ravel_pytree(theta_est)
     # broadcast the mask to the same shape as theta
-    param_mask = jax.tree_map(lambda t, p: np.broadcast_to(p, t.shape),
-                              theta_est, param_mask)
+    param_mask = jax.tree_util.tree_map(
+        lambda t, p: np.broadcast_to(p, t.shape), theta_est, param_mask)
     param_mask_flat, _ = jax.tree_util.tree_flatten(param_mask)
     param_mask_flat = np.concatenate(
         [np.atleast_1d(p) for p in param_mask_flat])
