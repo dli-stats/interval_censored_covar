@@ -967,7 +967,7 @@ def solve_theta(
         m_step_ls_maxiter=10,
         t1_predictor: T1Predictor = time1_identity_predictor,
         update_beta_beta1_xi_include_lambda2_closed_form: bool = False,
-        fix_params: Sequence[str] = tuple(),
+        fixed_params: Sequence[str] = tuple(),
 ):
     """solve for theta using the EM algorithm"""
     pd = _fix_sizes(
@@ -1003,7 +1003,7 @@ def solve_theta(
 
         # Update beta2, beta1, log_lambda1
         all_params = ["gamma", "beta2", "beta1", "log_lambda1"]
-        update_params = [p for p in all_params if p not in fix_params]
+        update_params = [p for p in all_params if p not in fixed_params]
         x = {k: getattr(state.theta_current, k) for k in update_params}
         x_flat, x_unraveler = jax.flatten_util.ravel_pytree(x)
 
