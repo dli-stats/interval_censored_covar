@@ -48,8 +48,8 @@ class IntervalCensoredData:
     max_cluster_size: int
 
     # These fields all have shape (episode_size,)
-    z2: chex.Array
-    us: chex.Array
+    feature_t2: chex.Array
+    feature_t1: chex.Array
     lb1: chex.Array
     rb1: chex.Array
     lb2: chex.Array
@@ -66,14 +66,14 @@ class IntervalCensoredData:
 # Define data generation function
 def dat_gen(key: chex.PRNGKey,
             sample_size: int,
-            gamma: Sequence[float],
-            beta2: float,
+            gamma1: Sequence[float],
+            gamma2: Sequence[float],
             beta1: float,
             a1: int,
             b1: int,
             a2: int,
             b2: int,
-            z2_bernoulli: bool,
+            common_feature_bernoulli: bool,
             time1_frequency: str,
             time2_frequency: str,
             t1_predictor: T1Predictor = time1_identity_predictor,
@@ -82,7 +82,7 @@ def dat_gen(key: chex.PRNGKey,
             corr_value_times2: Optional[float] = 0.5,
             obs_last_t2_prob: Optional[float] = 0.3,
             return_debug_data: bool = False,
-            common_z2: bool = True) -> IntervalCensoredData:
+            num_common_feature: int = 0) -> IntervalCensoredData:
     """generate data"""
 
     # if time1_frequency == "low":
@@ -138,11 +138,12 @@ def dat_gen(key: chex.PRNGKey,
         num_scheulding2 = 60
 
     # Generate random keys
-    (key_cluser_size, tt1_key, z2_key, us_key, scheduling_times1_key,
-     scheduling_times2_key, tt2_key, key_is_obs_last_t2) = jrandom.split(key,
-                                                                         num=8)
+    (key_cluser_size, tt1_key, common_feature_key, us_key,
+     scheduling_times1_key, scheduling_times2_key, tt2_key,
+     key_is_obs_last_t2) = jrandom.split(key, num=8)
 
-    gamma = jnp.array(gamma)
+    gamma1 = jnp.array(list(gamma1))
+    gamma2 = jnp.array(list(gamma2))
 
     # Generate cluster sizes
     gen_clustered = cluster_size_prob is not None
@@ -164,13 +165,19 @@ def dat_gen(key: chex.PRNGKey,
 
     cluster_id = jnp.where(cluster_mask, cluster_id, -1)
 
-    # Generate z2 (the covariate for true_times2)
-    if z2_bernoulli:
-        z2_original = jrandom.bernoulli(z2_key, p=0.5, shape=(sample_size, ))
+    # Generate common features
+    if common_feature_bernoulli:
+        common_feature_original = jrandom.bernoulli(common_feature_key,
+                                                    p=0.5,
+                                                    shape=(sample_size,
+                                                           num_common_feature))
     else:
-        z2_original = jrandom.normal(z2_key, shape=(sample_size, ))
-    z2 = jnp.broadcast_to(z2_original[..., None],
-                          (sample_size, max_cluster_size))
+        common_feature_original = jrandom.normal(common_feature_key,
+                                                 shape=(sample_size,
+                                                        num_common_feature))
+    common_feature = jnp.broadcast_to(
+        common_feature_original[..., None, :],
+        (sample_size, max_cluster_size, num_common_feature))
 
     # Generate Gaussian marginals from a Gaussian copula for clustered data
     @functools.partial(jax.vmap, in_axes=(0, 0, None))
@@ -199,29 +206,33 @@ def dat_gen(key: chex.PRNGKey,
         tt1_raw = jrandom.uniform(tt1_key, (sample_size, max_cluster_size))
         tt2_raw = jrandom.uniform(tt2_key, (sample_size, max_cluster_size))
 
-    # Generate us, the covariates for true_times1 (can be common or not with true_times2)
-    if common_z2:
-        # us = jnp.broadcast_to(z2_original[..., None], (sample_size, gamma.shape[0]))
-        # us is composed of z2_original and random normal variables of shape (sample_size, gamma.shape[0]-1)
-        # shape of us is (sample_size, gamma.shape[0])
-        us = jrandom.normal(us_key, shape=(sample_size, gamma.shape[0] - 1))
-        us = jnp.concatenate([z2_original[..., None], us], axis=1)
+    # Generate t1 features, the covariates for true_times1
+    feature_t1 = jrandom.normal(us_key,
+                                shape=(sample_size,
+                                       gamma1.shape[0] - num_common_feature))
+    feature_t1 = jnp.concatenate([common_feature_original, feature_t1], axis=1)
+    feature_t1 = jnp.broadcast_to(
+        feature_t1[...,
+                   None, :], (sample_size, max_cluster_size, gamma1.shape[0]))
 
-    else:
-        us = jrandom.normal(us_key, shape=(sample_size, gamma.shape[0]))
+    # Generate t2 features, the covariates for true_times2
+    feature_t2 = jrandom.normal(us_key,
+                                shape=(sample_size,
+                                       gamma2.shape[0] - num_common_feature))
+    feature_t2 = jnp.concatenate([common_feature_original, feature_t2], axis=1)
+    feature_t2 = jnp.broadcast_to(
+        feature_t2[...,
+                   None, :], (sample_size, max_cluster_size, gamma2.shape[0]))
 
-    us = jnp.broadcast_to(us[..., None, :],
-                          (sample_size, max_cluster_size, gamma.shape[0]))
-    # true_times1 = jnp.where(cluster_mask, (-jnp.log(tt1_raw))**(1 / b1) * a1,
-    #                         -jnp.inf)
     true_times1 = jnp.where(
         cluster_mask,
-        ((-jnp.log(tt1_raw) / jnp.exp(us @ gamma)))**(1 / b1) * a1, -jnp.inf)
+        ((-jnp.log(tt1_raw) / jnp.exp(feature_t1 @ gamma1)))**(1 / b1) * a1,
+        -jnp.inf)
     true_times2 = jnp.where(
         cluster_mask,
         ((-jnp.log(tt2_raw) /
-          jnp.exp(beta2 * z2 + beta1 * t1_predictor(true_times1))))**(1 / b2) *
-        a2, -jnp.inf)
+          jnp.exp(feature_t2 @ gamma2 + beta1 * t1_predictor(true_times1))))
+        **(1 / b2) * a2, -jnp.inf)
 
     # Generate scheduling times
     def scheduling_time(key, constant_increment, random_increment,
@@ -264,16 +275,17 @@ def dat_gen(key: chex.PRNGKey,
     observed = observed.at[jnp.arange(sample_size),
                            cluster_sizes].set(last_t2_obs)
 
-    data = IntervalCensoredData(sample_size=sample_size,
-                                max_cluster_size=max_cluster_size,
-                                z2=z2.ravel(),
-                                us=us.reshape(-1, us.shape[-1]),
-                                lb1=lb1.ravel(),
-                                rb1=rb1.ravel(),
-                                lb2=lb2.ravel(),
-                                rb2=rb2.ravel(),
-                                cluster_id=cluster_id.ravel(),
-                                observed=observed.ravel())
+    data = IntervalCensoredData(
+        sample_size=sample_size,
+        max_cluster_size=max_cluster_size,
+        feature_t2=feature_t2.reshape(-1, feature_t2.shape[-1]),
+        feature_t1=feature_t1.reshape(-1, feature_t1.shape[-1]),
+        lb1=lb1.ravel(),
+        rb1=rb1.ravel(),
+        lb2=lb2.ravel(),
+        rb2=rb2.ravel(),
+        cluster_id=cluster_id.ravel(),
+        observed=observed.ravel())
     if return_debug_data:
         return (data, true_times1, true_times2, tt1_raw, tt2_raw)
     else:
@@ -283,6 +295,7 @@ def dat_gen(key: chex.PRNGKey,
 def unique_times(
         input_data: IntervalCensoredData) -> Tuple[chex.Array, chex.Array]:
     """obtain unique times"""
+
     def compute_uts(lb, rb):
         right_censored_idxs = np.isinf(rb)
         left_censored_idxs = lb == 0
@@ -534,7 +547,7 @@ class PreprocessedData(IntervalCensoredData):
 def preprocess_data(input_data: IntervalCensoredData) -> PreprocessedData:
     """preprocess data"""
 
-    episode_size = input_data.z2.shape[0]
+    episode_size = input_data.feature_t2.shape[0]
 
     input_data = jax.tree_util.tree_map(
         lambda x: np.asarray(x)[input_data.cluster_mask]
@@ -643,8 +656,8 @@ def batch_preprocess_data(batch_input_data: Sequence[IntervalCensoredData],
     op_tree = PreprocessedData(
         sample_size=MaxScalar(),
         max_cluster_size=MaxScalar(),
-        z2=Pad(pad_multiple),
-        us=Pad(pad_multiple, fill_value=0),
+        feature_t2=Pad(pad_multiple, fill_value=0),
+        feature_t1=Pad(pad_multiple, fill_value=0),
         lb1=Pad(pad_multiple),
         rb1=Pad(pad_multiple),
         lb2=Pad(pad_multiple),
@@ -673,8 +686,8 @@ def batch_preprocess_data(batch_input_data: Sequence[IntervalCensoredData],
 
 class Parameters(NamedTuple):
     """Parameters for the model."""
-    gamma: chex.Array
-    beta2: chex.Scalar
+    gamma1: chex.Array
+    gamma2: chex.Scalar
     beta1: chex.Scalar
     log_lambda1: chex.Array
     log_lambda2: chex.Array
@@ -709,16 +722,17 @@ def expected_i_given_current_estimate_pairs(
     import jax.ops
 
     lambda1_cumsum = left_cumsum(current_theta.lambda1)
-    expbz = jnp.exp(pd.us[pd.ut_index1.episode_bracket] @ current_theta.gamma)
+    expbz = jnp.exp(
+        pd.feature_t1[pd.ut_index1.episode_bracket] @ current_theta.gamma1)
     part1_2_for_pairs1 = (
         jnp.exp(-(lambda1_cumsum[:-1][pd.ut_index1.time]) * expbz) -
         jnp.exp(-(lambda1_cumsum[1:][pd.ut_index1.time]) * expbz))
 
     part3_for_pairs1 = jnp.exp(
         safe_mul(
-            -jnp.exp(
-                current_theta.beta2 * pd.z2[pd.ut_index1.episode_bracket] +
-                current_theta.beta1 * ut1_in_predictor[pd.ut_index1.time]),
+            -jnp.exp(pd.feature_t2[pd.ut_index1.episode_bracket]
+                     @ current_theta.gamma2 + current_theta.beta1 *
+                     ut1_in_predictor[pd.ut_index1.time]),
             jax.ops.segment_sum(
                 current_theta.lambda2[pd.ut_index2_lt_lb3l.time],
                 pd.ut_index2_lt_lb3l.idx2l,
@@ -726,9 +740,9 @@ def expected_i_given_current_estimate_pairs(
 
     part4_for_pairs1 = jnp.exp(
         safe_mul(
-            -jnp.exp(
-                current_theta.beta2 * pd.z2[pd.ut_index1.episode_bracket] +
-                current_theta.beta1 * ut1_in_predictor[pd.ut_index1.time]),
+            -jnp.exp(pd.feature_t2[pd.ut_index1.episode_bracket]
+                     @ current_theta.gamma2 + current_theta.beta1 *
+                     ut1_in_predictor[pd.ut_index1.time]),
             jax.ops.segment_sum(
                 current_theta.lambda2[pd.ut_index2_lt_rb3l.time],
                 pd.ut_index2_lt_rb3l.idx2l,
@@ -743,7 +757,7 @@ def expected_i_given_current_estimate_pairs(
     denominator_pairs = jax.ops.segment_sum(
         numerator_pairs1,
         pd.ut_index1.episode_bracket,
-        num_segments=pd.z2.shape[0])[pd.ut_index1.episode_bracket]
+        num_segments=pd.feature_t2.shape[0])[pd.ut_index1.episode_bracket]
 
     expected_I = jnp.where(denominator_pairs == 0, 0,
                            (numerator_pairs1 / denominator_pairs))
@@ -772,20 +786,19 @@ def expected_wi_given_current_estimate_triplets_bwb(
 
     part5_for_triplets_bwb = jnp.exp(
         current_theta.log_lambda2[pd.ut_index2_bwb3l.time] +
-        current_theta.beta2 * pd.z2[unique_i_idx_triplets_bwb] +
+        pd.feature_t2[unique_i_idx_triplets_bwb] @ current_theta.gamma2 +
         current_theta.beta1 * uts1_in_predictor[unique_t1_idx_triplets_bwb])
 
     sum_lambda2_for_unique_t2_within_brackets2_for_part6 = jax.ops.segment_sum(
         current_theta.lambda2[pd.ut_index2.time],
         pd.ut_index2.episode_bracket,
-        num_segments=pd.z2.shape[0])
+        num_segments=pd.feature_t2.shape[0])
 
-    part6_for_triplets = -jnp.expm1(
-        -jnp.exp(current_theta.beta2 * pd.z2[unique_i_idx_triplets_bwb] +
-                 current_theta.beta1 *
-                 uts1_in_predictor[unique_t1_idx_triplets_bwb]) *
-        sum_lambda2_for_unique_t2_within_brackets2_for_part6[
-            unique_i_idx_triplets_bwb])
+    part6_for_triplets = -jnp.expm1(-jnp.exp(
+        pd.feature_t2[unique_i_idx_triplets_bwb] @ current_theta.gamma2 +
+        current_theta.beta1 * uts1_in_predictor[unique_t1_idx_triplets_bwb]
+    ) * sum_lambda2_for_unique_t2_within_brackets2_for_part6[
+        unique_i_idx_triplets_bwb])
 
     return jnp.where(
         pd.ut_index2_bwb3l.idx2l >= 0,
@@ -826,7 +839,7 @@ def q_for_estep(
         pd.ut_index2_lt_rb_star3l.idx2l]
 
     lambda1_cumsum = left_cumsum(theta.lambda1)
-    expbz = jnp.exp(pd.us[pd.ut_index1.episode_bracket] @ theta.gamma)
+    expbz = jnp.exp(pd.feature_t1[pd.ut_index1.episode_bracket] @ theta.gamma1)
     part1_2_for_pairs1 = jnp.log(
         jnp.exp(-(lambda1_cumsum[:-1][pd.ut_index1.time]) * expbz) -
         jnp.exp(-(lambda1_cumsum[1:][pd.ut_index1.time]) * expbz))
@@ -841,7 +854,7 @@ def q_for_estep(
     part2_segment_sum = jax.ops.segment_sum(
         expected_WI_triplets_bwb *
         (theta.log_lambda2[pd.ut_index2_bwb3l.time] +
-         theta.beta2 * pd.z2[unique_i_idx_triplets_bwb] +
+         pd.feature_t2[unique_i_idx_triplets_bwb] @ theta.gamma2 +
          theta.beta1 * uts1_in_predictor[unique_t1_idx_triplets_bwb]),
         pd.ut_index2_bwb3l.idx2l,
         num_segments=pd.ut_index1.time.shape[0])
@@ -849,8 +862,8 @@ def q_for_estep(
     part3_segment_sum = jax.ops.segment_sum(
         expected_I_pairs[pd.ut_index2_lt_rb_star3l.idx2l] *
         jnp.exp(theta.log_lambda2[pd.ut_index2_lt_rb_star3l.time] +
-                theta.beta2 * pd.z2[unique_i_idx_triplets_lt_rb_star] +
-                theta.beta1 *
+                pd.feature_t2[unique_i_idx_triplets_lt_rb_star] @ theta.gamma2
+                + theta.beta1 *
                 uts1_in_predictor[unique_t1_idx_triplets_lt_rb_star]),
         pd.ut_index2_lt_rb_star3l.idx2l,
         num_segments=pd.ut_index1.time.shape[0])
@@ -863,7 +876,7 @@ def q_for_estep(
 
     # jax.debug.breakpoint()
     return (part1_sum_pairs + part2_sum_pairs -
-            part3_sum_pairs) / pd.z2.shape[0]
+            part3_sum_pairs) / pd.feature_t2.shape[0]
 
 
 class EMResult(NamedTuple):
@@ -912,9 +925,10 @@ def update_lambda2(
                                     num_segments=pd.uts2.shape[0])
 
     denominator = jax.ops.segment_sum(safe_mul(
-        jnp.exp(theta.beta2 * pd.z2[unique_i_idx_triplets_lt_rb_star] +
-                theta.beta1 *
-                uts1_in_predictor[unique_t1_idx_triplets_lt_rb_star]),
+        jnp.exp(
+            pd.feature_t2[unique_i_idx_triplets_lt_rb_star] @ theta.gamma2 +
+            theta.beta1 *
+            uts1_in_predictor[unique_t1_idx_triplets_lt_rb_star]),
         expected_I_pairs[pd.ut_index2_lt_rb_star3l.idx2l] *
         pd.observed[unique_i_idx_triplets_lt_rb_star]),
                                       pd.ut_index2_lt_rb_star3l.time,
@@ -956,19 +970,31 @@ LoopState = collections.namedtuple(
     "LoopState", ["theta_prev", "theta_current", "m_step_status", "step"])
 
 
+def _unpack_theta(update_params, fixed_masks, theta, x_updated):
+    for p in update_params:
+        if p in fixed_masks:
+            xp = getattr(theta, p)
+            mask = fixed_masks[p]
+            xp = xp.at[~mask].set(x_updated[p])
+        else:
+            xp = x_updated[p]
+        theta = theta._replace(**{p: xp})
+    return theta
+
+
 def solve_theta(
-        static_sizes: StaticSizes,
-        pd: PreprocessedData,
-        initial_guess: Parameters,
-        e_step_tol=1e-3,
-        m_step_tol=1e-3,
-        e_step_maxiter=1000,
-        m_step_maxiter=1000,
-        m_step_ls_maxiter=10,
-        t1_predictor: T1Predictor = time1_identity_predictor,
-        update_beta_beta1_xi_include_lambda2_closed_form: bool = False,
-        fixed_params: Sequence[str] = tuple(),
-):
+    static_sizes: StaticSizes,
+    pd: PreprocessedData,
+    initial_guess: Parameters,
+    e_step_tol=1e-3,
+    m_step_tol=1e-3,
+    e_step_maxiter=1000,
+    m_step_maxiter=1000,
+    m_step_ls_maxiter=10,
+    t1_predictor: T1Predictor = time1_identity_predictor,
+    update_beta_beta1_xi_include_lambda2_closed_form: bool = False,
+    # solve_params: Parameters = None,
+    fixed_params: Dict[str, Union[Sequence[int], bool]] = dict()):
     """solve for theta using the EM algorithm"""
     pd = _fix_sizes(
         pd,
@@ -986,8 +1012,8 @@ def solve_theta(
     )
 
     def cond_fn(state: LoopState):
+
         def to_v(theta):
-            # gamma, beta2, beta1, log_lambda1, log_lambda2 = theta
             return jax.flatten_util.ravel_pytree(theta)[0]
 
         return ((state.m_step_status == 0) &
@@ -1001,61 +1027,79 @@ def solve_theta(
 
         state = state._replace(theta_prev=state.theta_current)
 
-        # Update beta2, beta1, log_lambda1
-        all_params = ["gamma", "beta2", "beta1", "log_lambda1"]
-        update_params = [p for p in all_params if p not in fixed_params]
-        x = {k: getattr(state.theta_current, k) for k in update_params}
+        all_params = ["gamma1", "gamma2", "beta1", "log_lambda1"]
+        fixed_masks = {}
+        update_params = []
+        for p in all_params:
+            if not isinstance(fixed_params[p], bool):
+                if len(fixed_params[p]):
+                    mask = np.zeros(getattr(state.theta_current, p).shape,
+                                    dtype=bool)
+                    mask[list(fixed_params[p])] = True
+                    fixed_masks[p] = mask
+                else:
+                    update_params.append(p)
+            elif not fixed_params[p]:
+                update_params.append(p)
+        x = {
+            p: (getattr(state.theta_current, p)[fixed_masks[p]]
+                if p in fixed_masks else getattr(state.theta_current, p))
+            for p in update_params
+        }
+
         x_flat, x_unraveler = jax.flatten_util.ravel_pytree(x)
 
-        def coord_q(x_flat: chex.Array) -> float:
-            current_theta = state.theta_current
-            theta = current_theta._replace(**x_unraveler(x_flat))
-            if update_beta_beta1_xi_include_lambda2_closed_form:
-                log_lambda2 = update_lambda2(
-                    pd,
-                    current_theta,
-                    theta,
-                    t1_predictor=t1_predictor,
-                )
-                theta = theta._replace(log_lambda2=log_lambda2)
-            return -q_for_estep(pd, current_theta, theta, t1_predictor)
+        if len(x_flat) > 0:
 
-        opt_result = jnr.minimize(coord_q,
-                                  x_flat,
-                                  atol=1e-3,
-                                  rtol=m_step_tol,
-                                  maxiter=m_step_maxiter,
-                                  maxls=m_step_ls_maxiter)
-        new_gamma, new_beta2, new_beta1, new_log_lambda1 = x_unraveler(
-            opt_result.guess)
-        state = state._replace(m_step_status=opt_result.status)
+            def coord_q(x_flat: chex.Array) -> float:
+                current_theta = state.theta_current
+                x_updated = x_unraveler(x_flat)
+                theta = _unpack_theta(update_params, fixed_masks,
+                                      current_theta, x_updated)
+
+                if update_beta_beta1_xi_include_lambda2_closed_form:
+                    log_lambda2 = update_lambda2(
+                        pd,
+                        current_theta,
+                        theta,
+                        t1_predictor=t1_predictor,
+                    )
+                    theta = theta._replace(log_lambda2=log_lambda2)
+                return -q_for_estep(pd, current_theta, theta, t1_predictor)
+
+            opt_result = jnr.minimize(coord_q,
+                                      x_flat,
+                                      atol=1e-3,
+                                      rtol=m_step_tol,
+                                      maxiter=m_step_maxiter,
+                                      maxls=m_step_ls_maxiter)
+            x_updated = x_unraveler(opt_result.guess)
+            state = state._replace(m_step_status=opt_result.status)
+            new_theta = _unpack_theta(update_params, fixed_masks,
+                                      state.theta_current, x_updated)
+        else:
+            new_theta = state.theta_current
 
         # Update Lambda2
         new_log_lambda2 = update_lambda2(
             pd,
             state.theta_current,
-            state.theta_current._replace(beta2=new_beta2, beta1=new_beta1),
+            new_theta,
             t1_predictor=t1_predictor,
         )
 
         # jax.debug.breakpoint()
 
         state = state._replace(
-            theta_current=Parameters(
-                gamma=new_gamma,
-                beta2=new_beta2,
-                beta1=new_beta1,
-                log_lambda1=new_log_lambda1,
-                log_lambda2=new_log_lambda2,
-            ),
+            theta_current=new_theta._replace(log_lambda2=new_log_lambda2),
             step=state.step + 1,
         )
 
         # jax.debug.print(
-        #     "P: {p}\n L2: {lambda2}\n beta2={beta2} beta1={beta1} opt_result={opt_result}===",
+        #     "P: {p}\n L2: {lambda2}\n gamma2={gamma2} beta1={beta1} opt_result={opt_result}===",
         #     p=state.theta_current.p(pd.lambda1_mask()),
         #     lambda2=jnp.exp(new_log_lambda2),
-        #     beta2=new_beta2,
+        #     gamma2=new_gamma2,
         #     beta1=new_beta1,
         #     opt_result=opt_result,
         # )
@@ -1129,8 +1173,9 @@ def obs_loglik_at_cluster(
     ut_index2_lt_rb3l_time = pd.ut_index2_lt_rb3l.time[
         ut_index2_lt_rb3l_cluster_idx]
 
-    part12_power1_ = -jnp.exp(theta.beta2 * pd.z2[ut_index1_episode_bracket] +
-                              theta.beta1 * ut1_in_predictor[ut_index1_time])
+    part12_power1_ = -jnp.exp(
+        pd.feature_t2[ut_index1_episode_bracket] @ theta.gamma2 +
+        theta.beta1 * ut1_in_predictor[ut_index1_time])
     part1_power2_ = jax.ops.segment_sum(
         theta.lambda2[ut_index2_lt_lb3l_time],
         ut_index2_lt_lb3l_idx2l,
@@ -1145,7 +1190,7 @@ def obs_loglik_at_cluster(
     part2 = jnp.exp(part12_power1_ * part2_power2_)
 
     lambda1_cumsum = left_cumsum(theta.lambda1)
-    expbz = jnp.exp(pd.us[ut_index1_episode_bracket] @ theta.gamma)
+    expbz = jnp.exp(pd.feature_t1[ut_index1_episode_bracket] @ theta.gamma1)
     log_part3 = jnp.log(
         jnp.exp(-(lambda1_cumsum[:-1][ut_index1_time]) * expbz) -
         jnp.exp(-(lambda1_cumsum[1:][ut_index1_time]) * expbz))
@@ -1215,15 +1260,15 @@ def obs_loglik(
 
 
 cov_sandwich_deriv_only_beta_beta1 = Parameters(
-    gamma=2,
-    beta2=2,
+    gamma1=2,
+    gamma2=2,
     beta1=2,
     log_lambda1=0,
     log_lambda2=0,
 )
 cov_sandwich_deriv_all = Parameters(
-    gamma=2,
-    beta2=2,
+    gamma1=2,
+    gamma2=2,
     beta1=2,
     log_lambda1=1,
     log_lambda2=1,
@@ -1331,6 +1376,7 @@ def compute_cov(
         def hessfn_padded(*hess_args, **hess_kwargs):
             """Hessian function that handles padded parameters
                 to make the hessian invertible."""
+
             def f(*args, **kwargs):
                 hess = hessfn(*hess_args, **hess_kwargs)(*args, **kwargs)
                 pmask = jnp.concatenate([
@@ -1383,6 +1429,7 @@ def compute_cov(
 
 def jacfd(f, eps: float = 1e-6):
     """Compute the Jacobian of a function using finite differences."""
+
     def wrapped(x, *args, **kwargs):
         chex.assert_rank(x, 1)
 
@@ -1429,24 +1476,31 @@ def make_fd_funs(static_sizes,
       deriv_hof: The derivative function to use, either jacfd or hessfd.
       f: The function to differentiate, which is the true likelihood function.
     """
+
         def derivfun(x, *args, **kwargs):
             """The wrapped derivative function, has the same input signature as f,
       returns the corresponding derivative."""
+
             def newf(theta_deriv, theta_fixed, pd, *args):
                 """An overloaded version of f. It is the same as f, except that it
         used the re-solved version of theta_fixed (lambda2) given
-        current theta_deriv (beta2, beta1 and xi) using the profiled likelihood."""
+        current theta_deriv (gamma2, beta1 and xi) using the profiled likelihood."""
 
                 if theta_deriv is x:
                     return f(theta_deriv, theta_fixed, pd, *args)
 
                 theta_flat_ = jnp.concatenate([theta_deriv, theta_fixed])
                 theta_ = unraveler(theta_flat_)
-                result = solve_theta(static_sizes,
-                                     pd,
-                                     theta_,
-                                     **solver_kwargs,
-                                     update_beta_beta1_xi=False)
+                result = solve_theta(
+                    static_sizes,
+                    pd,
+                    theta_,
+                    **solver_kwargs,
+                    fixed_params=dict(gamma1=True,
+                                      gamma2=True,
+                                      beta1=True,
+                                      log_lambda1=True),
+                )
                 return f(
                     theta_deriv,
                     jnp.concatenate(
@@ -1473,13 +1527,16 @@ def make_cf_funs(param_templ: Parameters, use_cg: bool = False):
       deriv_hof: The derivative function to use, either jacfd or hessfd.
       f: The function to differentiate, which is the true likelihood function.
     """
+
         def derivfun(theta_deriv, theta_fixed, pd: PreprocessedData):
             """The wrapped derivative function, has the same input signature as f,
       returns the corresponding derivative."""
+
             def newf(theta_deriv, theta_fixed, pd: PreprocessedData, *args):
                 """An overloaded version of f. It is the same as f, except that it
         used the re-solved version of theta_fixed (lambda2) given
-        current theta_deriv (beta2, beta1 and xi) using the profiled likelihood."""
+        current theta_deriv (gamma2, beta1 and xi) using the profiled likelihood."""
+
                 def update_lambda_fun(theta_deriv, theta_fixed):
                     theta_flat_ = jnp.concatenate([theta_deriv, theta_fixed])
                     theta_ = unraveler(theta_flat_)
