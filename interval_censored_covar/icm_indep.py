@@ -1031,16 +1031,18 @@ def solve_theta(
         fixed_masks = {}
         update_params = []
         for p in all_params:
-            if not isinstance(fixed_params[p], bool):
+            if isinstance(fixed_params[p], (list, tuple)):
                 if len(fixed_params[p]):
                     mask = np.zeros(getattr(state.theta_current, p).shape,
                                     dtype=bool)
                     mask[list(fixed_params[p])] = True
                     fixed_masks[p] = mask
-                else:
-                    update_params.append(p)
-            elif not fixed_params[p]:
                 update_params.append(p)
+            elif isinstance(fixed_params[p], bool):
+                if not fixed_params[p]:
+                    update_params.append(p)
+            else:
+                raise ValueError(f"Invalid fixed_params for {p}")
         x = {
             p: (getattr(state.theta_current, p)[fixed_masks[p]]
                 if p in fixed_masks else getattr(state.theta_current, p))
